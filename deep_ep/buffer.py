@@ -12,7 +12,7 @@ from .utils import EventOverlap, check_nvlink_connections
 
 class _TorchDistEvent:
     def current_stream_wait(self) -> None:
-        pass
+        torch.cuda.synchronize()
 
 
 class Buffer:
