@@ -17,17 +17,14 @@ extern nvshmem_team_t cpu_rdma_team;
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS > 0 and NUM_MAX_NVL_PEERS <= 8, "Invalid number of maximum NVL peers");
 
     __forceinline__ SourceMeta() = default;
 
     // TODO: faster encoding
-    __device__ __forceinline__ SourceMeta(int rdma_rank, const bool* is_token_in_nvl_ranks) {
+    __device__ __forceinline__ SourceMeta(int rdma_rank, uint64_t is_token_in_nvl_rank_mask) {
         src_rdma_rank = rdma_rank;
-        is_token_in_nvl_rank_bits = is_token_in_nvl_ranks[0];
-        #pragma unroll
-        for (int i = 1; i < NUM_MAX_NVL_PEERS; ++ i)
-            is_token_in_nvl_rank_bits |= is_token_in_nvl_ranks[i] << i;
+        is_token_in_nvl_rank_bits = static_cast<int>(is_token_in_nvl_rank_mask);
     }
 
     __device__ __forceinline__ bool is_token_in_nvl_rank(int nvl_rank) const {
@@ -36,6 +33,14 @@ struct SourceMeta {
 };
 
 EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+
+__device__ __forceinline__ uint64_t get_nvl_rank_mask(const bool* is_token_in_nvl_ranks) {
+    uint64_t mask = 0;
+    #pragma unroll
+    for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i)
+        mask |= static_cast<uint64_t>(is_token_in_nvl_ranks[i]) << i;
+    return mask;
+}
 
 int get_source_meta_bytes() {
     return sizeof(SourceMeta);
@@ -259,13 +264,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
-                auto is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
-                auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
+                auto is_token_in_rank_mask = get_nvl_rank_mask(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
                 #pragma unroll
                 for (int j = 0; j < NUM_MAX_NVL_PEERS; ++ j)
-                    per_nvl_rank_count[j] += is_token_in_rank_values[j];
-                total_count += (is_token_in_rank_uint64 != 0);
+                    per_nvl_rank_count[j] += (is_token_in_rank_mask >> j) & 1;
+                total_count += (is_token_in_rank_mask != 0);
             }
 
             // Warp reduce
@@ -408,7 +411,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     EP_DEVICE_ASSERT(num_topk <= 32);
 
     // RDMA symmetric layout
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
     auto scale_bytes = num_scales * sizeof(float);
     auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
@@ -496,21 +498,21 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++ token_idx) {
             // Read RDMA rank existence
-            uint64_t is_token_in_rank_uint64 = 0;
+            uint64_t is_token_in_rank_mask = 0;
             if (lane_id < kNumRDMARanks) {
-                is_token_in_rank_uint64 = __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
-                global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
+                is_token_in_rank_mask = get_nvl_rank_mask(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS);
+                global_rdma_tail_idx += (is_token_in_rank_mask != 0);
             }
             __syncwarp();
 
             // Skip the token which does not belong to this warp
             if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
                 continue;
-            auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
+            auto rdma_tail_idx = is_token_in_rank_mask == 0 ? -1 : global_rdma_tail_idx - 1;
 
             // Wait the remote buffer to be released
             auto start_time = clock64();
-            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
+            while (is_token_in_rank_mask != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
 
                 // Timeout check
@@ -534,10 +536,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             for (int i = 0, slot_idx; i < kNumRDMARanks; ++ i) if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
                 slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
                 topk_ranks[num_topk_ranks] = i;
-                auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
-                auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
+                auto recv_is_token_in_rank_mask = broadcast(is_token_in_rank_mask, i);
                 if (lane_id == num_topk_ranks)
-                    src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
+                    src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_mask);
                 dst_send_buffers[num_topk_ranks ++] = reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_token;
             }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
@@ -585,7 +586,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             __syncwarp();
 
             // Release the transaction in the window
-            if (is_token_in_rank_uint64 != 0) {
+            if (is_token_in_rank_mask != 0) {
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
                 auto latest_tail = rdma_send_channel_tail[lane_id];
