@@ -103,9 +103,11 @@ def test_main(args: argparse.Namespace, num_sms: int,
             assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
             check_start = check_end
 
+    current_xs = (x_pure_rand, x) if os.getenv('DEEPEP_INTERNODE_BACKEND') == 'torch_dist' else \
+        (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3)
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3):
+            for current_x in current_xs:
                 for with_topk in (False, True):
                     is_rand = current_x is x_pure_rand or current_x is x_pure_rand_e4m3
                     if local_rank == 0:
