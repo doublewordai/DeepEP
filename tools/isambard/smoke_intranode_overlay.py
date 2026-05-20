@@ -114,6 +114,7 @@ def worker(local_rank: int, args: argparse.Namespace):
             flush=True,
         )
 
+    dist.barrier(group=group)
     buffer.destroy()
     dist.barrier(group=group)
     dist.destroy_process_group()
