@@ -33,11 +33,30 @@ if __name__ == '__main__':
     if not disable_nvshmem:
         assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
 
+    include_dirs = ['csrc/']
+    for cuda_package in ('nvidia.cu13', 'nvidia.cuda_runtime', 'nvidia.cusparse'):
+        try:
+            package_dir = importlib.util.find_spec(cuda_package).submodule_search_locations[0]
+            include_dir = Path(package_dir).joinpath('include')
+            if include_dir.exists():
+                include_dirs.append(str(include_dir))
+            cccl_include_dir = include_dir.joinpath('cccl')
+            if cccl_include_dir.exists():
+                include_dirs.append(str(cccl_include_dir))
+        except (ModuleNotFoundError, AttributeError, IndexError):
+            pass
+    for include_dir in (Path('/usr/local/cuda/include/cccl'),):
+        if include_dir.exists():
+            include_dirs.append(str(include_dir))
+
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
+    num_max_nvl_peers = int(os.getenv('NUM_MAX_NVL_PEERS', os.getenv('LEGACY_NUM_MAX_NVL_PEERS', '8')))
+    assert 0 < num_max_nvl_peers <= 8, 'NUM_MAX_NVL_PEERS must be in [1, 8]'
+    cxx_flags.append(f'-DNUM_MAX_NVL_PEERS={num_max_nvl_peers}')
+    nvcc_flags.append(f'-DNUM_MAX_NVL_PEERS={num_max_nvl_peers}')
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
-    include_dirs = ['csrc/']
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = []

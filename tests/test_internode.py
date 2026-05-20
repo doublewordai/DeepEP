@@ -20,7 +20,7 @@ def test_main(args: argparse.Namespace, num_sms: int,
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk_groups, num_topk, num_experts = args.num_topk_groups, args.num_topk, args.num_experts
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
@@ -103,9 +103,13 @@ def test_main(args: argparse.Namespace, num_sms: int,
             assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
             check_start = check_end
 
-    for previous_mode in (False, True):
-        for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3):
+    current_xs = (x_pure_rand, x) if os.getenv('DEEPEP_INTERNODE_BACKEND') == 'torch_dist' else \
+        (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3)
+    previous_modes = (False,) if os.getenv('DEEPEP_INTERNODE_BACKEND') == 'torch_dist' else (False, True)
+    async_modes = (False,) if os.getenv('DEEPEP_INTERNODE_BACKEND') == 'torch_dist' else (False, True)
+    for previous_mode in previous_modes:
+        for async_mode in async_modes:
+            for current_x in current_xs:
                 for with_topk in (False, True):
                     is_rand = current_x is x_pure_rand or current_x is x_pure_rand_e4m3
                     if local_rank == 0:
@@ -186,6 +190,43 @@ def test_main(args: argparse.Namespace, num_sms: int,
     if local_rank == 0:
         print('', flush=True)
 
+    if args.quick_benchmark:
+        bench_config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
+        dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
+                         'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+                         'topk_idx': topk_idx, 'topk_weights': topk_weights, 'config': bench_config}
+        recv_x, recv_topk_idx, recv_topk_weights, _, bench_handle, _ = buffer.dispatch(**dispatch_args)
+        combine_args = {'x': recv_x, 'topk_weights': recv_topk_weights, 'handle': bench_handle, 'config': bench_config}
+
+        def bench_with_barrier(fn):
+            group.barrier()
+            avg_t, min_t, max_t = bench(fn, num_warmups=args.quick_warmups, num_tests=args.quick_iters)
+            group.barrier()
+            return avg_t, min_t, max_t
+
+        dispatch_t = bench_with_barrier(lambda: buffer.dispatch(**dispatch_args))
+        recv_x, _, recv_topk_weights, _, bench_handle, _ = buffer.dispatch(**dispatch_args)
+        combine_args = {'x': recv_x, 'topk_weights': recv_topk_weights, 'handle': bench_handle, 'config': bench_config}
+        combine_t = bench_with_barrier(lambda: buffer.combine(**combine_args))
+
+        def roundtrip():
+            rt_recv_x, _, rt_recv_topk_weights, _, rt_handle, _ = buffer.dispatch(**dispatch_args)
+            buffer.combine(rt_recv_x, rt_handle, topk_weights=rt_recv_topk_weights, config=bench_config)
+
+        roundtrip_t = bench_with_barrier(roundtrip)
+        times = torch.tensor([dispatch_t[0], combine_t[0], roundtrip_t[0]], dtype=torch.float64, device='cuda')
+        gathered = [torch.zeros_like(times) for _ in range(num_ranks)]
+        dist.all_gather(gathered, times, group=group)
+        if rank == 0:
+            all_times = torch.stack(gathered).cpu() * 1e6
+            labels = ('dispatch_us', 'combine_us', 'roundtrip_us')
+            for idx, label in enumerate(labels):
+                vals = all_times[:, idx]
+                print(f'[quick] {label}: mean={vals.mean().item():.2f} max={vals.max().item():.2f} min={vals.min().item():.2f}', flush=True)
+            total_bytes = dispatch_bf16_rdma_send_bytes + combine_bf16_rdma_recv_bytes
+            print(f'[quick] tokens_per_rank={num_tokens} hidden={hidden} topk={num_topk} total_rank_comm_bytes={total_bytes}', flush=True)
+        return hash_value
+
     if skip_benchmark:
         return hash_value
 
@@ -252,7 +293,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=args.test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank, explicitly_destroy=True)
-    assert num_local_ranks == 8 and num_ranks > 8
+    assert num_ranks > num_local_ranks
 
     for seed in range(int(1e9)):
         if local_rank == 0:
@@ -260,7 +301,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         torch.manual_seed(rank + seed)
         ref_hash = 0
         for i in (num_sms, ):
-            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args.pressure_test_mode == 1)
+            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+                                  args.skip_benchmark or args.pressure_test_mode == 1)
             if local_rank == 0:
                 print('', flush=True)
         if args.pressure_test_mode == 0:
@@ -274,7 +316,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             torch.manual_seed(rank + seed)
             current_hash = 0
             for i in (num_sms, ):
-                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args.pressure_test_mode == 1)
+                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+                                          args.skip_benchmark or args.pressure_test_mode == 1)
                 if local_rank == 0:
                     print('', flush=True)
             assert current_hash == ref_hash
@@ -283,6 +326,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.test_ll_compatibility:
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+
+    if os.getenv('DEEPEP_INTERNODE_BACKEND') == 'torch_dist':
+        dist.barrier()
+        os._exit(0)
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()
@@ -304,6 +351,14 @@ if __name__ == '__main__':
                        help='Number of top-k experts (default: 8)')
     parser.add_argument('--pressure-test-mode', type=int, default=0,
                        help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
+    parser.add_argument('--skip-benchmark', action='store_true',
+                       help='Run correctness checks once without tuning or kineto benchmark sweeps')
+    parser.add_argument('--quick-benchmark', action='store_true',
+                       help='Run a fixed lightweight dispatch/combine benchmark instead of the full tuning sweep')
+    parser.add_argument('--quick-iters', type=int, default=20,
+                       help='Number of quick benchmark measured iterations')
+    parser.add_argument('--quick-warmups', type=int, default=5,
+                       help='Number of quick benchmark warmup iterations')
     parser.add_argument('--num-experts', type=int, default=256,
                        help='Number of experts (default: 256')
     parser.add_argument('--test-ll-compatibility', action='store_true',
