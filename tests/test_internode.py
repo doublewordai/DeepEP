@@ -260,7 +260,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         torch.manual_seed(rank + seed)
         ref_hash = 0
         for i in (num_sms, ):
-            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args.pressure_test_mode == 1)
+            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+                                  args.skip_benchmark or args.pressure_test_mode == 1)
             if local_rank == 0:
                 print('', flush=True)
         if args.pressure_test_mode == 0:
@@ -274,7 +275,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             torch.manual_seed(rank + seed)
             current_hash = 0
             for i in (num_sms, ):
-                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args.pressure_test_mode == 1)
+                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+                                          args.skip_benchmark or args.pressure_test_mode == 1)
                 if local_rank == 0:
                     print('', flush=True)
             assert current_hash == ref_hash
@@ -304,6 +306,8 @@ if __name__ == '__main__':
                        help='Number of top-k experts (default: 8)')
     parser.add_argument('--pressure-test-mode', type=int, default=0,
                        help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
+    parser.add_argument('--skip-benchmark', action='store_true',
+                       help='Run correctness checks once without tuning or kineto benchmark sweeps')
     parser.add_argument('--num-experts', type=int, default=256,
                        help='Number of experts (default: 256')
     parser.add_argument('--test-ll-compatibility', action='store_true',
