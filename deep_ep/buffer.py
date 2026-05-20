@@ -10,6 +10,11 @@ from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
 
 
+class _TorchDistEvent:
+    def current_stream_wait(self) -> None:
+        pass
+
+
 class Buffer:
     """
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
@@ -81,7 +86,9 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
-        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy)
+        self.internode_backend = os.getenv('DEEPEP_INTERNODE_BACKEND', 'nvshmem')
+        runtime_rdma_bytes = 0 if self.internode_backend == 'torch_dist' and not low_latency_mode else num_rdma_bytes
+        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, runtime_rdma_bytes, low_latency_mode, explicitly_destroy)
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
@@ -93,7 +100,7 @@ class Buffer:
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
-        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+        if (self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode) and self.internode_backend != 'torch_dist':
             # Enable IBGDA
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
@@ -358,6 +365,10 @@ class Buffer:
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
             assert num_worst_tokens == 0, 'Internode dispatch does not support `num_worst_tokens > 0`'
+            if self.internode_backend == 'torch_dist':
+                return self.torch_dist_dispatch(
+                    x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
+                    num_tokens_per_expert, topk_idx, topk_weights, previous_event)
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                                            topk_idx, topk_weights, expert_alignment, config, previous_event, async_finish, allocate_on_comm_stream)
 
@@ -418,6 +429,8 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
+            if self.internode_backend == 'torch_dist':
+                return self.torch_dist_combine(x, handle, topk_weights, bias, previous_event)
             return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
@@ -481,6 +494,132 @@ class Buffer:
                       recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                       recv_src_meta, send_rdma_head, send_nvl_head)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
+
+    def _torch_dist_all_to_all(self, tensor: torch.Tensor, send_splits: List[int]) -> Tuple[torch.Tensor, List[int]]:
+        all_send_splits = [None] * self.group_size
+        dist.all_gather_object(all_send_splits, list(send_splits), self.group)
+        recv_splits = [all_send_splits[src][self.rank] for src in range(self.group_size)]
+        output = torch.empty((sum(recv_splits), *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        dist.all_to_all_single(output, tensor.contiguous(),
+                               output_split_sizes=recv_splits,
+                               input_split_sizes=send_splits,
+                               group=self.group)
+        return output, recv_splits
+
+    def torch_dist_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                            handle: Optional[Tuple] = None,
+                            num_tokens_per_rank: Optional[torch.Tensor] = None,
+                            num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+                            is_token_in_rank: Optional[torch.Tensor] = None,
+                            num_tokens_per_expert: Optional[torch.Tensor] = None,
+                            topk_idx: Optional[torch.Tensor] = None,
+                            topk_weights: Optional[torch.Tensor] = None,
+                            previous_event: Optional[EventOverlap] = None):
+        if previous_event is not None:
+            previous_event.current_stream_wait()
+        x, x_scales = x if isinstance(x, tuple) else (x, None)
+        if handle is not None:
+            assert handle[0] == 'torch_dist'
+            _, _, _, _, _, send_order, send_splits = handle
+            recv_x, _ = self._torch_dist_all_to_all(x[send_order], send_splits)
+            recv_x_scales = None
+            if x_scales is not None:
+                recv_x_scales, _ = self._torch_dist_all_to_all(x_scales[send_order], send_splits)
+            recv = (recv_x, recv_x_scales) if x_scales is not None else recv_x
+            return recv, None, None, None, None, EventOverlap(_TorchDistEvent())
+
+        assert topk_idx is not None, 'torch_dist DeepEP prototype requires topk_idx'
+        assert num_tokens_per_expert is not None
+
+        num_tokens = x.size(0)
+        num_topk = topk_idx.size(1)
+        num_experts = num_tokens_per_expert.numel()
+        experts_per_rank = num_experts // self.group_size
+        rank_idx = topk_idx // experts_per_rank
+        rank_idx = rank_idx.masked_fill(topk_idx == -1, -1)
+
+        send_x, send_scales, send_topk_idx, send_topk_weights, send_src_idx = [], [], [], [], []
+        send_splits = []
+        token_ids = torch.arange(num_tokens, dtype=torch.long, device=x.device)
+        for dst_rank in range(self.group_size):
+            token_mask = (rank_idx == dst_rank).any(dim=1)
+            send_splits.append(int(token_mask.sum().item()))
+            send_x.append(x[token_mask])
+            send_src_idx.append(token_ids[token_mask])
+            if x_scales is not None:
+                send_scales.append(x_scales[token_mask])
+            local_idx = topk_idx[token_mask] - dst_rank * experts_per_rank
+            local_idx = torch.where((local_idx >= 0) & (local_idx < experts_per_rank),
+                                    local_idx, torch.full_like(local_idx, -1))
+            send_topk_idx.append(local_idx.contiguous())
+            if topk_weights is not None:
+                send_topk_weights.append(topk_weights[token_mask])
+
+        packed_x = torch.cat(send_x, dim=0) if send_x else x.new_empty((0, *x.shape[1:]))
+        recv_x, recv_splits = self._torch_dist_all_to_all(packed_x, send_splits)
+        recv_src_rank = torch.cat([
+            torch.full((split,), src_rank, dtype=torch.long, device=x.device)
+            for src_rank, split in enumerate(recv_splits)
+        ], dim=0)
+        packed_src_idx = torch.cat(send_src_idx, dim=0) if send_src_idx else token_ids.new_empty((0,))
+        recv_src_idx, _ = self._torch_dist_all_to_all(packed_src_idx, send_splits)
+
+        recv_x_scales = None
+        if x_scales is not None:
+            packed_scales = torch.cat(send_scales, dim=0) if send_scales else x_scales.new_empty((0, *x_scales.shape[1:]))
+            recv_x_scales, _ = self._torch_dist_all_to_all(packed_scales, send_splits)
+
+        packed_topk_idx = torch.cat(send_topk_idx, dim=0) if send_topk_idx else topk_idx.new_empty((0, num_topk))
+        recv_topk_idx, _ = self._torch_dist_all_to_all(packed_topk_idx, send_splits)
+        recv_topk_weights = None
+        if topk_weights is not None:
+            packed_topk_weights = torch.cat(send_topk_weights, dim=0) if send_topk_weights else topk_weights.new_empty((0, num_topk))
+            recv_topk_weights, _ = self._torch_dist_all_to_all(packed_topk_weights, send_splits)
+
+        gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+        dist.all_reduce(gbl_num_tokens_per_expert, group=self.group)
+        num_recv_tokens_per_expert_list = gbl_num_tokens_per_expert.view(self.group_size, -1)[self.rank].tolist()
+
+        send_order = torch.cat(send_src_idx, dim=0) if send_src_idx else token_ids.new_empty((0,))
+        handle = ('torch_dist', recv_src_rank, recv_src_idx, num_tokens, num_topk, send_order, send_splits)
+        recv = (recv_x, recv_x_scales) if x_scales is not None else recv_x
+        return recv, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(_TorchDistEvent())
+
+    def torch_dist_combine(self, x: torch.Tensor, handle: Union[tuple, list],
+                           topk_weights: Optional[torch.Tensor] = None,
+                           bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
+                           previous_event: Optional[EventOverlap] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        if previous_event is not None:
+            previous_event.current_stream_wait()
+        assert handle[0] == 'torch_dist'
+        _, recv_src_rank, recv_src_idx, num_tokens, num_topk, _, _ = handle
+        send_splits = [(recv_src_rank == dst_rank).sum().item() for dst_rank in range(self.group_size)]
+        order = torch.cat([
+            torch.nonzero(recv_src_rank == dst_rank, as_tuple=False).flatten()
+            for dst_rank in range(self.group_size)
+        ], dim=0)
+
+        packed_x = x[order]
+        recv_x, recv_splits = self._torch_dist_all_to_all(packed_x, send_splits)
+        packed_idx = recv_src_idx[order]
+        out_idx, _ = self._torch_dist_all_to_all(packed_idx, send_splits)
+
+        combined_x = torch.zeros((num_tokens, x.size(1)), dtype=x.dtype, device=x.device)
+        combined_x.index_add_(0, out_idx.long(), recv_x)
+        bias_0, bias_1 = Buffer._unpack_bias(bias)
+        if bias_0 is not None:
+            combined_x = combined_x + bias_0
+        if bias_1 is not None:
+            combined_x = combined_x + bias_1
+
+        combined_topk_weights = None
+        if topk_weights is not None:
+            packed_weights = topk_weights[order]
+            recv_weights, _ = self._torch_dist_all_to_all(packed_weights, send_splits)
+            combined_topk_weights = torch.zeros((num_tokens, num_topk), dtype=topk_weights.dtype, device=topk_weights.device)
+            combined_topk_weights.index_add_(0, out_idx.long(), recv_weights)
+
+        return combined_x, combined_topk_weights, EventOverlap(_TorchDistEvent())
 
     # noinspection PyTypeChecker
     def internode_combine(self, x: torch.Tensor, handle: Union[tuple, list],

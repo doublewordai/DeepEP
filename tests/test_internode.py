@@ -20,7 +20,7 @@ def test_main(args: argparse.Namespace, num_sms: int,
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk_groups, num_topk, num_experts = args.num_topk_groups, args.num_topk, args.num_experts
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
@@ -252,7 +252,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=args.test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank, explicitly_destroy=True)
-    assert num_local_ranks == 8 and num_ranks > 8
+    assert num_ranks > num_local_ranks
 
     for seed in range(int(1e9)):
         if local_rank == 0:
