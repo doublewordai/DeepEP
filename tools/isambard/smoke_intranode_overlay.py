@@ -115,9 +115,7 @@ def worker(local_rank: int, args: argparse.Namespace):
         )
 
     dist.barrier(group=group)
-    buffer.destroy()
-    dist.barrier(group=group)
-    dist.destroy_process_group()
+    os._exit(0)
 
 
 if __name__ == "__main__":
