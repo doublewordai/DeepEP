@@ -528,32 +528,35 @@ class Buffer:
             recv = (recv_x, recv_x_scales) if x_scales is not None else recv_x
             return recv, None, None, None, None, EventOverlap(_TorchDistEvent())
 
-        assert topk_idx is not None, 'torch_dist DeepEP prototype requires topk_idx'
+        assert topk_idx is not None or is_token_in_rank is not None
         assert num_tokens_per_expert is not None
 
         num_tokens = x.size(0)
-        num_topk = topk_idx.size(1)
+        num_topk = topk_idx.size(1) if topk_idx is not None else 0
         num_experts = num_tokens_per_expert.numel()
         experts_per_rank = num_experts // self.group_size
-        rank_idx = topk_idx // experts_per_rank
-        rank_idx = rank_idx.masked_fill(topk_idx == -1, -1)
+        rank_idx = None
+        if topk_idx is not None:
+            rank_idx = topk_idx // experts_per_rank
+            rank_idx = rank_idx.masked_fill(topk_idx == -1, -1)
 
         send_x, send_scales, send_topk_idx, send_topk_weights, send_src_idx = [], [], [], [], []
         send_splits = []
         token_ids = torch.arange(num_tokens, dtype=torch.long, device=x.device)
         for dst_rank in range(self.group_size):
-            token_mask = (rank_idx == dst_rank).any(dim=1)
+            token_mask = (rank_idx == dst_rank).any(dim=1) if rank_idx is not None else is_token_in_rank[:, dst_rank]
             send_splits.append(int(token_mask.sum().item()))
             send_x.append(x[token_mask])
             send_src_idx.append(token_ids[token_mask])
             if x_scales is not None:
                 send_scales.append(x_scales[token_mask])
-            local_idx = topk_idx[token_mask] - dst_rank * experts_per_rank
-            local_idx = torch.where((local_idx >= 0) & (local_idx < experts_per_rank),
-                                    local_idx, torch.full_like(local_idx, -1))
-            send_topk_idx.append(local_idx.contiguous())
-            if topk_weights is not None:
-                send_topk_weights.append(topk_weights[token_mask])
+            if topk_idx is not None:
+                local_idx = topk_idx[token_mask] - dst_rank * experts_per_rank
+                local_idx = torch.where((local_idx >= 0) & (local_idx < experts_per_rank),
+                                        local_idx, torch.full_like(local_idx, -1))
+                send_topk_idx.append(local_idx.contiguous())
+                if topk_weights is not None:
+                    send_topk_weights.append(topk_weights[token_mask])
 
         packed_x = torch.cat(send_x, dim=0) if send_x else x.new_empty((0, *x.shape[1:]))
         recv_x, recv_splits = self._torch_dist_all_to_all(packed_x, send_splits)
@@ -569,8 +572,10 @@ class Buffer:
             packed_scales = torch.cat(send_scales, dim=0) if send_scales else x_scales.new_empty((0, *x_scales.shape[1:]))
             recv_x_scales, _ = self._torch_dist_all_to_all(packed_scales, send_splits)
 
-        packed_topk_idx = torch.cat(send_topk_idx, dim=0) if send_topk_idx else topk_idx.new_empty((0, num_topk))
-        recv_topk_idx, _ = self._torch_dist_all_to_all(packed_topk_idx, send_splits)
+        recv_topk_idx = None
+        if topk_idx is not None:
+            packed_topk_idx = torch.cat(send_topk_idx, dim=0) if send_topk_idx else topk_idx.new_empty((0, num_topk))
+            recv_topk_idx, _ = self._torch_dist_all_to_all(packed_topk_idx, send_splits)
         recv_topk_weights = None
         if topk_weights is not None:
             packed_topk_weights = torch.cat(send_topk_weights, dim=0) if send_topk_weights else topk_weights.new_empty((0, num_topk))
