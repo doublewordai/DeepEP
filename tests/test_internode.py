@@ -190,6 +190,43 @@ def test_main(args: argparse.Namespace, num_sms: int,
     if local_rank == 0:
         print('', flush=True)
 
+    if args.quick_benchmark:
+        bench_config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
+        dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
+                         'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+                         'topk_idx': topk_idx, 'topk_weights': topk_weights, 'config': bench_config}
+        recv_x, recv_topk_idx, recv_topk_weights, _, bench_handle, _ = buffer.dispatch(**dispatch_args)
+        combine_args = {'x': recv_x, 'topk_weights': recv_topk_weights, 'handle': bench_handle, 'config': bench_config}
+
+        def bench_with_barrier(fn):
+            group.barrier()
+            avg_t, min_t, max_t = bench(fn, num_warmups=args.quick_warmups, num_tests=args.quick_iters)
+            group.barrier()
+            return avg_t, min_t, max_t
+
+        dispatch_t = bench_with_barrier(lambda: buffer.dispatch(**dispatch_args))
+        recv_x, _, recv_topk_weights, _, bench_handle, _ = buffer.dispatch(**dispatch_args)
+        combine_args = {'x': recv_x, 'topk_weights': recv_topk_weights, 'handle': bench_handle, 'config': bench_config}
+        combine_t = bench_with_barrier(lambda: buffer.combine(**combine_args))
+
+        def roundtrip():
+            rt_recv_x, _, rt_recv_topk_weights, _, rt_handle, _ = buffer.dispatch(**dispatch_args)
+            buffer.combine(rt_recv_x, rt_handle, topk_weights=rt_recv_topk_weights, config=bench_config)
+
+        roundtrip_t = bench_with_barrier(roundtrip)
+        times = torch.tensor([dispatch_t[0], combine_t[0], roundtrip_t[0]], dtype=torch.float64, device='cuda')
+        gathered = [torch.zeros_like(times) for _ in range(num_ranks)]
+        dist.all_gather(gathered, times, group=group)
+        if rank == 0:
+            all_times = torch.stack(gathered).cpu() * 1e6
+            labels = ('dispatch_us', 'combine_us', 'roundtrip_us')
+            for idx, label in enumerate(labels):
+                vals = all_times[:, idx]
+                print(f'[quick] {label}: mean={vals.mean().item():.2f} max={vals.max().item():.2f} min={vals.min().item():.2f}', flush=True)
+            total_bytes = dispatch_bf16_rdma_send_bytes + combine_bf16_rdma_recv_bytes
+            print(f'[quick] tokens_per_rank={num_tokens} hidden={hidden} topk={num_topk} total_rank_comm_bytes={total_bytes}', flush=True)
+        return hash_value
+
     if skip_benchmark:
         return hash_value
 
@@ -316,6 +353,12 @@ if __name__ == '__main__':
                        help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
     parser.add_argument('--skip-benchmark', action='store_true',
                        help='Run correctness checks once without tuning or kineto benchmark sweeps')
+    parser.add_argument('--quick-benchmark', action='store_true',
+                       help='Run a fixed lightweight dispatch/combine benchmark instead of the full tuning sweep')
+    parser.add_argument('--quick-iters', type=int, default=20,
+                       help='Number of quick benchmark measured iterations')
+    parser.add_argument('--quick-warmups', type=int, default=5,
+                       help='Number of quick benchmark warmup iterations')
     parser.add_argument('--num-experts', type=int, default=256,
                        help='Number of experts (default: 256')
     parser.add_argument('--test-ll-compatibility', action='store_true',
