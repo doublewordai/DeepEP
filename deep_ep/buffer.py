@@ -520,7 +520,7 @@ class Buffer:
         x, x_scales = x if isinstance(x, tuple) else (x, None)
         if handle is not None:
             assert handle[0] == 'torch_dist'
-            _, _, _, _, _, send_order, send_splits, _ = handle
+            _, _, _, _, _, send_order, send_splits, _, _, _, _, _ = handle
             recv_x, _ = self._torch_dist_all_to_all(x[send_order], send_splits)
             recv_x_scales = None
             if x_scales is not None:
@@ -586,7 +586,10 @@ class Buffer:
         num_recv_tokens_per_expert_list = gbl_num_tokens_per_expert.view(self.group_size, -1)[self.rank].tolist()
 
         send_order = torch.cat(send_src_idx, dim=0) if send_src_idx else token_ids.new_empty((0,))
-        handle = ('torch_dist', recv_src_rank, recv_src_idx, num_tokens, num_topk, send_order, send_splits, recv_topk_idx)
+        recv_gbl_rank_prefix_sum = torch.tensor(recv_splits, dtype=torch.int32, device=x.device).cumsum(0)
+        handle = ('torch_dist', recv_src_rank, recv_src_idx, num_tokens, num_topk,
+                  send_order, send_splits, recv_topk_idx, recv_gbl_rank_prefix_sum,
+                  None, None, None)
         recv = (recv_x, recv_x_scales) if x_scales is not None else recv_x
         return recv, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(_TorchDistEvent())
 
@@ -597,7 +600,7 @@ class Buffer:
         if previous_event is not None:
             previous_event.current_stream_wait()
         assert handle[0] == 'torch_dist'
-        _, recv_src_rank, recv_src_idx, num_tokens, num_topk, _, _, recv_topk_idx = handle
+        _, recv_src_rank, recv_src_idx, num_tokens, num_topk, _, _, recv_topk_idx, _, _, _, _ = handle
         send_splits = [(recv_src_rank == dst_rank).sum().item() for dst_rank in range(self.group_size)]
         order = torch.cat([
             torch.nonzero(recv_src_rank == dst_rank, as_tuple=False).flatten()
