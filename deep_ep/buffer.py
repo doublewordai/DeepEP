@@ -587,9 +587,12 @@ class Buffer:
 
         send_order = torch.cat(send_src_idx, dim=0) if send_src_idx else token_ids.new_empty((0,))
         recv_gbl_rank_prefix_sum = torch.tensor(recv_splits, dtype=torch.int32, device=x.device).cumsum(0)
+        unrouted_topk_weights = None
+        if topk_idx is not None and topk_weights is not None:
+            unrouted_topk_weights = topk_weights.masked_fill(topk_idx != -1, 0)
         handle = ('torch_dist', recv_src_rank, recv_src_idx, num_tokens, num_topk,
                   send_order, send_splits, recv_topk_idx, recv_gbl_rank_prefix_sum,
-                  None, None, None)
+                  unrouted_topk_weights, None, None)
         recv = (recv_x, recv_x_scales) if x_scales is not None else recv_x
         return recv, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(_TorchDistEvent())
 
@@ -600,7 +603,7 @@ class Buffer:
         if previous_event is not None:
             previous_event.current_stream_wait()
         assert handle[0] == 'torch_dist'
-        _, recv_src_rank, recv_src_idx, num_tokens, num_topk, _, _, recv_topk_idx, _, _, _, _ = handle
+        _, recv_src_rank, recv_src_idx, num_tokens, num_topk, _, _, recv_topk_idx, _, unrouted_topk_weights, _, _ = handle
         send_splits = [(recv_src_rank == dst_rank).sum().item() for dst_rank in range(self.group_size)]
         order = torch.cat([
             torch.nonzero(recv_src_rank == dst_rank, as_tuple=False).flatten()
@@ -628,6 +631,8 @@ class Buffer:
             recv_weights, _ = self._torch_dist_all_to_all(packed_weights, send_splits)
             combined_topk_weights = torch.zeros((num_tokens, num_topk), dtype=topk_weights.dtype, device=topk_weights.device)
             combined_topk_weights.index_add_(0, out_idx.long(), recv_weights)
+            if unrouted_topk_weights is not None:
+                combined_topk_weights = combined_topk_weights + unrouted_topk_weights
 
         return combined_x, combined_topk_weights, EventOverlap(_TorchDistEvent())
 
