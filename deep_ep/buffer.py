@@ -580,6 +580,8 @@ class Buffer:
         if topk_weights is not None:
             packed_topk_weights = torch.cat(send_topk_weights, dim=0) if send_topk_weights else topk_weights.new_empty((0, num_topk))
             recv_topk_weights, _ = self._torch_dist_all_to_all(packed_topk_weights, send_splits)
+            if recv_topk_idx is not None:
+                recv_topk_weights = recv_topk_weights.masked_fill(recv_topk_idx == -1, 0)
 
         gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
         dist.all_reduce(gbl_num_tokens_per_expert, group=self.group)
@@ -625,8 +627,6 @@ class Buffer:
 
         combined_topk_weights = None
         if topk_weights is not None:
-            if recv_topk_idx is not None:
-                topk_weights = topk_weights.masked_fill(recv_topk_idx == -1, 0)
             packed_weights = topk_weights[order]
             recv_weights, _ = self._torch_dist_all_to_all(packed_weights, send_splits)
             combined_topk_weights = torch.zeros((num_tokens, num_topk), dtype=topk_weights.dtype, device=topk_weights.device)
